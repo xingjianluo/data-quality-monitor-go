@@ -1,0 +1,46 @@
+{
+  "datasets": [
+    {
+      "name": "users",
+      "path": "data/users.csv",
+      "format": "csv",
+      "schema": {
+        "fields": [
+          {"name": "id", "type": "int", "required": true},
+          {"name": "name", "type": "string", "required": true},
+          {"name": "status", "type": "string", "required": true},
+          {"name": "age", "type": "int", "required": false},
+          {"name": "signup_date", "type": "time", "format": "2006-01-02", "required": true}
+        ]
+      }
+    },
+    {
+      "name": "events",
+      "path": "data/events.jsonl",
+      "format": "jsonl",
+      "schema": {
+        "fields": [
+          {"name": "event_id", "type": "string", "required": true},
+          {"name": "user_id", "type": "string", "required": true},
+          {"name": "event", "type": "string", "required": true},
+          {"name": "ts", "type": "time", "format": "2006-01-02T15:04:05Z", "required": true}
+        ]
+      }
+    }
+  ],
+  "rules": [
+    {"id": "users-id-complete", "dataset": "users", "kind": "completeness", "severity": "error", "field": "id"},
+    {"id": "users-id-unique", "dataset": "users", "kind": "uniqueness", "severity": "error", "field": "id"},
+    {"id": "users-status-domain", "dataset": "users", "kind": "consistency", "severity": "warning", "field": "status",
+      "params": {"mode": "allowed", "allowed": ["active", "pending", "disabled"]}},
+    {"id": "users-age-range", "dataset": "users", "kind": "consistency", "severity": "error", "field": "age",
+      "params": {"mode": "range", "min": 0, "max": 150}},
+    {"id": "users-signup-fresh", "dataset": "users", "kind": "freshness", "severity": "warning", "field": "signup_date",
+      "params": {"max_age_seconds": 2592000}},
+    {"id": "events-user-complete", "dataset": "events", "kind": "completeness", "severity": "error", "field": "user_id"},
+    {"id": "events-key-unique", "dataset": "events", "kind": "uniqueness", "severity": "error",
+      "fields": ["event_id", "ts"]},
+    {"id": "events-ts-fresh", "dataset": "events", "kind": "freshness", "severity": "error", "field": "ts",
+      "params": {"max_age_seconds": 86400}}
+  ]
+}

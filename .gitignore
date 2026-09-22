@@ -1,0 +1,4 @@
+# local run artifacts
+/.dq-state/
+/dqmonitor
+*.tmp

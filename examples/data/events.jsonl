@@ -1,0 +1,4 @@
+{"event_id":"e1","user_id":"u1","event":"login","ts":"2026-09-23T09:00:00Z"}
+{"event_id":"e2","user_id":null,"event":"click","ts":"2026-09-23T08:30:00Z"}
+{"event_id":"e3","user_id":"u3","event":"purchase","ts":"2026-09-01T08:30:00Z"}
+{"event_id":"e4","user_id":"u1","event":"login","ts":"2026-09-23T09:00:00Z"}
