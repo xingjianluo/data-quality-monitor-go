@@ -1,0 +1,25 @@
+{
+  "batch_id": "2026-09-23-b2",
+  "ordinal": 2,
+  "watermark": "2026-09-23T12:00:00Z",
+  "datasets": [
+    {"name": "orders", "path": "b2/orders.json", "columns": [
+      {"name": "id", "type": "int"},
+      {"name": "user_id", "type": "int"},
+      {"name": "status", "type": "string"},
+      {"name": "updated_at", "type": "time"}
+    ]},
+    {"name": "users", "path": "b2/users.json", "columns": [
+      {"name": "id", "type": "int"},
+      {"name": "country", "type": "string"}
+    ]}
+  ],
+  "rules": [
+    {"id": "orders-id-complete", "type": "completeness", "dataset": "orders", "columns": ["id"], "min_non_null": 1.0},
+    {"id": "orders-id-unique",   "type": "uniqueness",   "dataset": "orders", "columns": ["id"]},
+    {"id": "orders-status-enum", "type": "consistency",  "dataset": "orders", "columns": ["status"], "allowed": ["paid", "pending", "refunded"]},
+    {"id": "orders-fresh",       "type": "freshness",    "dataset": "orders", "columns": ["updated_at"], "max_age": "24h"},
+    {"id": "users-id-unique",    "type": "uniqueness",   "dataset": "users",  "columns": ["id"]},
+    {"id": "users-country-enum", "type": "consistency",  "dataset": "users",  "columns": ["country"], "allowed": ["CN", "US"]}
+  ]
+}
