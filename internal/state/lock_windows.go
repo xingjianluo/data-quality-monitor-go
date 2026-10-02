@@ -2,9 +2,13 @@
 
 package state
 
-import "os"
+import (
+	"os"
+	"time"
+)
 
 // Windows file locking is not required for the local single-process test
 // harness; the in-process mutex still serializes access.
-func lockFile(f *os.File) error   { return nil }
-func unlockFile(f *os.File) error { return nil }
+func lockFile(f *os.File) error                           { return nil }
+func unlockFile(f *os.File) error                         { return nil }
+func acquireLock(f *os.File, timeout time.Duration) error { return nil }

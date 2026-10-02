@@ -28,6 +28,7 @@ import (
 	"github.com/xingjianluo/data-quality-monitor-go/internal/alert"
 	"github.com/xingjianluo/data-quality-monitor-go/internal/config"
 	"github.com/xingjianluo/data-quality-monitor-go/internal/datasource"
+	"github.com/xingjianluo/data-quality-monitor-go/internal/manifest"
 	"github.com/xingjianluo/data-quality-monitor-go/internal/model"
 	"github.com/xingjianluo/data-quality-monitor-go/internal/rule"
 	"github.com/xingjianluo/data-quality-monitor-go/internal/state"
@@ -37,12 +38,17 @@ import (
 const (
 	DefaultMaxConcurrentRules = 4
 	DefaultRuleTimeout        = 10 * time.Second
+	// DefaultLeaseTTL is the lease lifetime assumed when heartbeating. It must
+	// stay below the store's lease TTL so concurrent triggers keep seeing a live
+	// run; the store itself owns the authoritative TTL.
+	DefaultLeaseTTL = state.DefaultLeaseTTL
 )
 
 // Options controls engine resource use and deterministic evaluation time.
 type Options struct {
 	MaxConcurrentRules int
 	RuleTimeout        time.Duration
+	LeaseTTL           time.Duration
 	EvalTime           time.Time
 	Logger             *slog.Logger
 }
@@ -54,6 +60,18 @@ type Engine struct {
 	store   state.Store
 	alerter *alert.Alerter
 	opts    Options
+
+	// In-process single-flight: concurrent triggers of the same batch in one
+	// process join the single live execution instead of starting a second one.
+	flightMu sync.Mutex
+	flights  map[string]*flight
+}
+
+// flight is one shared in-process batch execution.
+type flight struct {
+	done chan struct{}
+	res  *model.BatchResult
+	err  error
 }
 
 // New constructs an Engine.
@@ -64,13 +82,16 @@ func New(cfg *config.Config, loader *datasource.Loader, store state.Store, alert
 	if opts.RuleTimeout <= 0 {
 		opts.RuleTimeout = DefaultRuleTimeout
 	}
+	if opts.LeaseTTL <= 0 {
+		opts.LeaseTTL = DefaultLeaseTTL
+	}
 	if opts.EvalTime.IsZero() {
 		opts.EvalTime = time.Now().UTC()
 	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	return &Engine{cfg: cfg, loader: loader, store: store, alerter: alerter, opts: opts}
+	return &Engine{cfg: cfg, loader: loader, store: store, alerter: alerter, opts: opts, flights: map[string]*flight{}}
 }
 
 type loadedDataset struct {
@@ -79,53 +100,100 @@ type loadedDataset struct {
 	err    error
 }
 
-// Run evaluates one batch. force=true reclaims a stale running batch; replay of
-// a committed batch returns its historical conclusions deterministically.
+// Run evaluates one batch.
+//
+//   - A committed batch is replayed only when the current inputs still match
+//     the stored manifest; drift (data or rules) returns *model.HistoryInvalidError
+//     without overwriting anything. Replays still fill any undelivered alert
+//     backlog.
+//   - A late-arriving, never-processed batch (even older than the latest one)
+//     is evaluated normally.
+//   - Concurrent triggers of the same batch join the single in-process
+//     execution and receive the same result; cross-process triggers get
+//     state.ErrBatchRunning.
+//   - force=true only reclaims an interrupted (lease-expired) batch; it never
+//     overwrites committed conclusions.
 func (e *Engine) Run(ctx context.Context, batchID string, force bool) (*model.BatchResult, error) {
 	log := e.opts.Logger.With("batch_id", batchID)
 
+	// In-process single flight: concurrent triggers share one execution.
+	e.flightMu.Lock()
+	if f, ok := e.flights[batchID]; ok {
+		e.flightMu.Unlock()
+		log.Info("batch already running in this process; joining the live execution")
+		select {
+		case <-f.done:
+			return f.res, f.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	f := &flight{done: make(chan struct{})}
+	e.flights[batchID] = f
+	e.flightMu.Unlock()
+
+	defer func() {
+		e.flightMu.Lock()
+		delete(e.flights, batchID)
+		e.flightMu.Unlock()
+	}()
+
+	f.res, f.err = e.runOnce(ctx, batchID, force, log)
+	close(f.done)
+	return f.res, f.err
+}
+
+func (e *Engine) runOnce(ctx context.Context, batchID string, force bool, log *slog.Logger) (*model.BatchResult, error) {
 	st, replay, err := e.store.Begin(ctx, batchID, force)
 	if err != nil {
 		return nil, err
 	}
+
+	currentManifest := manifest.Build(e.cfg, e.opts.EvalTime)
+
 	if replay {
-		log.Info("replaying committed batch", "fingerprint", st.Fingerprint, "rules", len(st.Results))
-		return &model.BatchResult{
-			BatchID:     batchID,
-			StartedAt:   st.StartedAt,
-			FinishedAt:  derefTime(st.CommittedAt),
-			Status:      "replay",
-			Results:     orderedResults(st.Results),
-			Fingerprint: st.Fingerprint,
-		}, nil
+		return e.replayCommitted(ctx, batchID, st, currentManifest, log)
 	}
 	lease := st.LeaseToken
 	startedAt := st.StartedAt
 
+	// Renew the lease while evaluating so a long batch still looks live to
+	// concurrent triggers; a lost lease aborts evaluation instead of
+	// committing onto a possibly-reclaimed batch.
+	hbCtx, stopHeartbeat := context.WithCancel(ctx)
+	hbErr := make(chan error, 1)
+	go e.heartbeat(hbCtx, batchID, lease, log, hbErr)
+	evalCtx, cancelEval := context.WithCancel(hbCtx)
+	defer func() {
+		stopHeartbeat()
+		cancelEval()
+	}()
+
 	// Load every dataset once, concurrently but bounded. Shape problems are
 	// normalized failures for all rules on that dataset, not silent passes.
-	loaded := e.loadDatasets(ctx, log)
+	loaded := e.loadDatasets(evalCtx, log)
 
-	results := e.evaluateRules(ctx, log, loaded)
+	results := e.evaluateRules(evalCtx, log, loaded)
 	results = orderedResults(results)
 
+	select {
+	case err := <-hbErr:
+		if err != nil {
+			log.Error("lease lost during evaluation; aborting without commit", "error", normalizedMessage(err))
+			_ = e.store.Fail(context.Background(), batchID, lease, "lease_lost")
+			return nil, err
+		}
+	default:
+	}
+
 	fp := fingerprint(batchID, e.opts.EvalTime, results)
-	if err := e.store.Commit(ctx, batchID, lease, fp, results); err != nil {
+	if err := e.store.Commit(ctx, batchID, lease, fp, currentManifest, results); err != nil {
 		log.Error("commit failed", "error", normalizedMessage(err))
 		_ = e.store.Fail(context.Background(), batchID, lease, "commit_failed")
 		return nil, err
 	}
 
-	status := "committed"
-	alertCount := 0
-	if e.alerter != nil {
-		n, alertErr := e.alerter.Dispatch(context.Background(), batchID, results, model.SeverityWarning)
-		if alertErr != nil {
-			// Alerting failure must not change verdicts; surface it in logs only.
-			log.Error("alert dispatch partially failed", "error", normalizedMessage(alertErr))
-		}
-		alertCount = n
-	}
+	outcome := e.dispatchAlerts(ctx, batchID, results, log)
 
 	failed, errored := summarizeCounts(results)
 	log.Info("batch committed",
@@ -134,16 +202,127 @@ func (e *Engine) Run(ctx context.Context, batchID string, force bool) (*model.Ba
 		"passed", len(results)-failed-errored,
 		"failed", failed,
 		"errored", errored,
-		"alerts", alertCount,
+		"alerts_sent", outcome.Sent,
+		"alerts_retried", outcome.Retried,
+		"alerts_pending", outcome.Pending,
 	)
 	return &model.BatchResult{
-		BatchID:     batchID,
-		StartedAt:   startedAt,
-		FinishedAt:  time.Now().UTC(),
-		Status:      status,
-		Results:     results,
-		Fingerprint: fp,
+		BatchID:       batchID,
+		StartedAt:     startedAt,
+		FinishedAt:    time.Now().UTC(),
+		Status:        "committed",
+		Results:       results,
+		Fingerprint:   fp,
+		AlertsSent:    outcome.Sent,
+		AlertsRetried: outcome.Retried,
+		AlertsPending: outcome.Pending,
 	}, nil
+}
+
+// replayCommitted serves a repeat run of a committed batch. Historical
+// conclusions are returned only when the current inputs match the stored
+// manifest; otherwise the conclusions are declared inapplicable with the
+// concrete data/rule differences, and nothing is overwritten. Undelivered
+// alerts are still filled from the stored results.
+func (e *Engine) replayCommitted(ctx context.Context, batchID string, st *state.BatchState, current manifest.Manifest, log *slog.Logger) (*model.BatchResult, error) {
+	if st.Manifest == nil {
+		// Committed by an older version before manifests existed: validity
+		// cannot be proven, so replay for compatibility and say so in logs.
+		log.Warn("stored batch predates input manifests; replaying without validity check",
+			"fingerprint", st.Fingerprint)
+	} else {
+		diffs := manifest.Compare(*st.Manifest, current)
+		if len(diffs) > 0 {
+			sideSet := map[model.InvalidationSide]bool{}
+			changes := make([]string, 0, len(diffs))
+			for _, d := range diffs {
+				log.Warn("historical conclusion invalidated",
+					"side", d.Side, "change", d.Detail)
+				changes = append(changes, d.Side+": "+d.Detail)
+				if d.Side == manifest.SideData {
+					sideSet[model.InvalidatedData] = true
+				} else {
+					sideSet[model.InvalidatedRules] = true
+				}
+			}
+			sides := make([]model.InvalidationSide, 0, len(sideSet))
+			if sideSet[model.InvalidatedData] {
+				sides = append(sides, model.InvalidatedData)
+			}
+			if sideSet[model.InvalidatedRules] {
+				sides = append(sides, model.InvalidatedRules)
+			}
+			return nil, &model.HistoryInvalidError{BatchID: batchID, Sides: sides, Changes: changes}
+		}
+		log.Info("historical conclusions still valid; replaying",
+			"fingerprint", st.Fingerprint, "rules", len(st.Results))
+	}
+
+	results := orderedResults(st.Results)
+	outcome := e.dispatchAlerts(ctx, batchID, results, log)
+	if outcome.Pending > 0 {
+		log.Warn("replayed batch still has undelivered alerts",
+			"alerts_retried", outcome.Retried, "alerts_pending", outcome.Pending)
+	} else {
+		log.Info("replay alert backlog settled",
+			"alerts_retried", outcome.Retried, "alerts_pending", 0)
+	}
+	return &model.BatchResult{
+		BatchID:       batchID,
+		StartedAt:     st.StartedAt,
+		FinishedAt:    derefTime(st.CommittedAt),
+		Status:        "replay",
+		Results:       results,
+		Fingerprint:   st.Fingerprint,
+		AlertsSent:    outcome.Sent,
+		AlertsRetried: outcome.Retried,
+		AlertsPending: outcome.Pending,
+	}, nil
+}
+
+// heartbeat renews the batch lease at roughly a third of the TTL so the lease
+// never expires during a healthy run.
+func (e *Engine) heartbeat(ctx context.Context, batchID, lease string, log *slog.Logger, errCh chan<- error) {
+	interval := e.opts.LeaseTTL / 3
+	if interval <= 0 {
+		interval = state.DefaultLeaseTTL / 3
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := e.store.Heartbeat(context.Background(), batchID, lease); err != nil {
+				log.Error("lease heartbeat failed", "error", normalizedMessage(err))
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
+		}
+	}
+}
+
+// dispatchAlerts sends failure notifications and normalizes accounting. A nil
+// alerter (alerts disabled) yields a zero outcome. Delivery failures never
+// alter verdicts; they are reflected in the pending count and logs.
+func (e *Engine) dispatchAlerts(ctx context.Context, batchID string, results []model.RuleResult, log *slog.Logger) alert.Outcome {
+	if e.alerter == nil {
+		return alert.Outcome{}
+	}
+	outcome, err := e.alerter.Dispatch(ctx, batchID, results, model.SeverityWarning)
+	if err != nil {
+		log.Error("alert dispatch partially failed",
+			"error", normalizedMessage(err),
+			"alerts_sent", outcome.Sent,
+			"alerts_retried", outcome.Retried,
+			"alerts_pending", outcome.Pending,
+		)
+	}
+	return outcome
 }
 
 func (e *Engine) loadDatasets(ctx context.Context, log *slog.Logger) map[string]loadedDataset {

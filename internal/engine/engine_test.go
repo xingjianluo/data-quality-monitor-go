@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -31,15 +32,43 @@ type fixture struct {
 }
 
 type countingSink struct {
-	mu     sync.Mutex
-	alerts []alert.Alert
+	mu        sync.Mutex
+	alerts    []alert.Alert
+	failRule  map[string]bool // rule ids that always fail to deliver
+	delivered map[string]bool
+	calls     int
 }
 
 func (c *countingSink) Send(ctx context.Context, a alert.Alert) error {
 	c.mu.Lock()
+	c.calls++
+	fail := c.failRule[a.RuleID]
+	c.mu.Unlock()
+	if fail {
+		return os.ErrInvalid
+	}
+	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.alerts = append(c.alerts, a)
+	if c.delivered == nil {
+		c.delivered = map[string]bool{}
+	}
+	c.delivered[a.Key()] = true
 	return nil
+}
+
+// Delivered implements alert.DeliveryChecker so the crash window between a
+// successful Send and journal durability cannot cause a duplicate.
+func (c *countingSink) Delivered(ctx context.Context, a alert.Alert) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.delivered[a.Key()], nil
+}
+
+func (c *countingSink) snapshot() []alert.Alert {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]alert.Alert(nil), c.alerts...)
 }
 
 // logCapture keeps structured log output so tests can assert input summaries
@@ -318,5 +347,376 @@ func TestLogsContainInputSummaryAndBasis(t *testing.T) {
 		if !strings.Contains(logs, want) {
 			t.Fatalf("logs missing %q\n%s", want, logs)
 		}
+	}
+}
+
+// --- late arrivals, validity and delivery backlog tests ------------------
+
+const usersCSVOriginal = "id,name,status\n1,A,active\n2,B,banned\n"
+
+func (f *fixture) rewriteData(t *testing.T, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(f.dir, "users.csv"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func historyInvalid(t *testing.T, err error) *model.HistoryInvalidError {
+	t.Helper()
+	var hi *model.HistoryInvalidError
+	if !errors.As(err, &hi) {
+		t.Fatalf("want *HistoryInvalidError, got %T: %v", err, err)
+	}
+	return hi
+}
+
+func TestLateBatchAfterNewerIsAccepted(t *testing.T) {
+	files := map[string]string{"users.csv": usersCSVOriginal}
+	fx := newFixture(t, files, baseRules(), usersDatasets())
+	eng := fx.engine(Options{})
+
+	// A newer batch commits first.
+	if _, err := eng.Run(context.Background(), "b-200", false); err != nil {
+		t.Fatal(err)
+	}
+	// An older, never-seen batch arrives late and is still fully evaluated.
+	late, err := eng.Run(context.Background(), "b-100", false)
+	if err != nil {
+		t.Fatalf("late batch must be accepted: %v", err)
+	}
+	if late.Status != "committed" || len(late.Results) != 3 {
+		t.Fatalf("late batch conclusions missing: %+v", late)
+	}
+}
+
+func TestReplayInvalidatedByDataChange(t *testing.T) {
+	files := map[string]string{"users.csv": usersCSVOriginal}
+	fx := newFixture(t, files, baseRules(), usersDatasets())
+	eng := fx.engine(Options{})
+	if _, err := eng.Run(context.Background(), "b-100", false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Same declaration, changed file content: historical conclusions no longer
+	// apply; the cause must be identifiable as the data side.
+	fx.rewriteData(t, "id,name,status\n1,A,active\n2,B,banned\n3,C,active\n")
+	_, err := eng.Run(context.Background(), "b-100", false)
+	hi := historyInvalid(t, err)
+	if !slicesContain(hi.Sides, model.InvalidatedData) || slicesContain(hi.Sides, model.InvalidatedRules) {
+		t.Fatalf("want data-only invalidation, got sides=%v changes=%v", hi.Sides, hi.Changes)
+	}
+	if len(hi.Changes) == 0 || !strings.Contains(hi.Error(), "users") {
+		t.Fatalf("invalid error must name the dataset: %v", err)
+	}
+	// The stored conclusions must be untouched.
+	st, _ := fx.store.Get(context.Background(), "b-100")
+	if st.Status != state.StatusCommitted || len(st.Results) != 3 {
+		t.Fatalf("history must remain intact: %+v", st)
+	}
+}
+
+func TestReplayInvalidatedByRuleParamChange(t *testing.T) {
+	files := map[string]string{"users.csv": usersCSVOriginal}
+	fx := newFixture(t, files, baseRules(), usersDatasets())
+	eng := fx.engine(Options{})
+	if _, err := eng.Run(context.Background(), "b-100", false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Data identical, but the rule declaration changed (allowed set widened).
+	for i := range fx.cfg.Rules {
+		if fx.cfg.Rules[i].ID == "r-domain" {
+			fx.cfg.Rules[i].Params = map[string]any{"mode": "allowed", "allowed": []any{"active", "pending", "banned"}}
+		}
+	}
+	_, err := eng.Run(context.Background(), "b-100", false)
+	hi := historyInvalid(t, err)
+	if !slicesContain(hi.Sides, model.InvalidatedRules) || slicesContain(hi.Sides, model.InvalidatedData) {
+		t.Fatalf("want rules-only invalidation, got sides=%v changes=%v", hi.Sides, hi.Changes)
+	}
+}
+
+func TestReplayInvalidatedBySourceDeleted(t *testing.T) {
+	files := map[string]string{"users.csv": usersCSVOriginal}
+	fx := newFixture(t, files, baseRules(), usersDatasets())
+	eng := fx.engine(Options{})
+	if _, err := eng.Run(context.Background(), "b-100", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(fx.dir, "users.csv")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := eng.Run(context.Background(), "b-100", false)
+	hi := historyInvalid(t, err)
+	if !slicesContain(hi.Sides, model.InvalidatedData) {
+		t.Fatalf("deleted source must invalidate on data side: sides=%v changes=%v", hi.Sides, hi.Changes)
+	}
+	if !strings.Contains(hi.Error(), "missing") {
+		t.Fatalf("error should explain the file is missing: %v", err)
+	}
+}
+
+func TestReplayUnchangedReproducesAndFillsNothing(t *testing.T) {
+	files := map[string]string{"users.csv": usersCSVOriginal}
+	fx := newFixture(t, files, baseRules(), usersDatasets())
+	eng := fx.engine(Options{})
+	b1, err := eng.Run(context.Background(), "b-100", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2, err := eng.Run(context.Background(), "b-100", false)
+	if err != nil {
+		t.Fatalf("unchanged replay must succeed: %v", err)
+	}
+	if b2.Status != "replay" || b2.Fingerprint != b1.Fingerprint {
+		t.Fatalf("replay mismatch: %s vs %s", b2.Status, b1.Fingerprint)
+	}
+	if b2.AlertsSent != 0 || b2.AlertsPending != 0 {
+		t.Fatalf("settled replay must report no alert work: %+v", b2)
+	}
+}
+
+func TestForceCannotOverwriteCommitted(t *testing.T) {
+	files := map[string]string{"users.csv": usersCSVOriginal}
+	fx := newFixture(t, files, baseRules(), usersDatasets())
+	if _, err := fx.engine(Options{}).Run(context.Background(), "b-100", false); err != nil {
+		t.Fatal(err)
+	}
+	_, err := fx.engine(Options{}).Run(context.Background(), "b-100", true)
+	if !errors.Is(err, state.ErrImmutable) {
+		t.Fatalf("force on committed batch: want ErrImmutable, got %v", err)
+	}
+}
+
+func TestAlertBacklogRetriedOnReplay(t *testing.T) {
+	files := map[string]string{"users.csv": usersCSVOriginal}
+	fx := newFixture(t, files, baseRules(), usersDatasets())
+	fx.sink.failRule = map[string]bool{"r-domain": true}
+	eng := fx.engine(Options{})
+
+	b1, err := eng.Run(context.Background(), "b-100", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// r-domain alert failed: one pending, nothing sent on the first run.
+	if b1.AlertsPending != 1 || b1.AlertsRetried != 0 || b1.AlertsSent != 0 {
+		t.Fatalf("first run alert accounting wrong: %+v", b1)
+	}
+
+	// Channel recovers. Repeating the batch replays and fills the backlog.
+	fx.sink.mu.Lock()
+	fx.sink.failRule = map[string]bool{}
+	fx.sink.mu.Unlock()
+	b2, err := eng.Run(context.Background(), "b-100", false)
+	if err != nil {
+		t.Fatalf("replay retry: %v", err)
+	}
+	if b2.AlertsRetried != 1 || b2.AlertsSent != 1 || b2.AlertsPending != 0 {
+		t.Fatalf("replay backlog accounting wrong: %+v", b2)
+	}
+	// Exactly one external notification per failed rule overall.
+	got := fx.sink.snapshot()
+	counts := map[string]int{}
+	for _, a := range got {
+		counts[a.RuleID]++
+	}
+	if counts["r-domain"] != 1 {
+		t.Fatalf("want exactly one r-domain notification, got %v", counts)
+	}
+
+	// A process restart (new Alerter over the same journal and sink) still
+	// delivers nothing and reports no pending backlog.
+	restarted, err := alert.NewAlerter(fx.sink, filepath.Join(fx.dir, "state", "journal.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.alerter = restarted
+	b3, err := fx.engine(Options{}).Run(context.Background(), "b-100", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b3.AlertsPending != 0 || b3.AlertsSent != 0 || b3.AlertsRetried != 0 {
+		t.Fatalf("post-restart replay must be settled: %+v", b3)
+	}
+	if len(fx.sink.snapshot()) != 1 {
+		t.Fatalf("restart must not duplicate: %d alerts", len(fx.sink.snapshot()))
+	}
+}
+
+func TestConcurrentTriggersShareOneExecution(t *testing.T) {
+	files := map[string]string{"users.csv": usersCSVOriginal}
+	fx := newFixture(t, files, baseRules(), usersDatasets())
+	eng := fx.engine(Options{})
+
+	const n = 8
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	results := make([]*model.BatchResult, n)
+	errs := make([]error, n)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			results[idx], errs[idx] = eng.Run(context.Background(), "b-100", false)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("trigger %d: %v", i, errs[i])
+		}
+		if results[i].Fingerprint != results[0].Fingerprint {
+			t.Fatalf("trigger %d got a different fingerprint", i)
+		}
+	}
+	committed, replay := 0, 0
+	for _, r := range results {
+		switch r.Status {
+		case "committed":
+			committed++
+		case "replay":
+			replay++
+		default:
+			t.Fatalf("unexpected status %s", r.Status)
+		}
+	}
+	if committed < 1 {
+		t.Fatal("at least one trigger must have performed the evaluation")
+	}
+	st, _ := fx.store.Get(context.Background(), "b-100")
+	if st.Status != state.StatusCommitted || len(st.Results) != 3 {
+		t.Fatalf("exactly one committed conclusion set expected: %+v", st)
+	}
+	// No duplicate external notifications despite the fan-out.
+	counts := map[string]int{}
+	for _, a := range fx.sink.snapshot() {
+		counts[a.RuleID]++
+	}
+	if len(counts) != 1 || counts["r-domain"] != 1 {
+		t.Fatalf("want exactly one r-domain notification, got %v", counts)
+	}
+	_ = committed
+	_ = replay
+}
+
+// TestCombinedLateConcurrentRetry runs the three new behaviors together under
+// -race: a late-arriving batch, concurrent triggers sharing one execution, and
+// alert-channel failure followed by backlog retry on replay.
+func TestCombinedLateConcurrentRetry(t *testing.T) {
+	files := map[string]string{"users.csv": usersCSVOriginal}
+	fx := newFixture(t, files, baseRules(), usersDatasets())
+	eng := fx.engine(Options{})
+
+	// Newer batch lands first.
+	if _, err := eng.Run(context.Background(), "b-300", false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Late older batch with a flaky channel, triggered concurrently.
+	fx.sink.failRule = map[string]bool{"r-domain": true}
+	const n = 6
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(n)
+	fps := make([]string, n)
+	pending := make([]int, n)
+	for i := 0; i < n; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			r, err := eng.Run(context.Background(), "b-100", false)
+			if err != nil {
+				t.Errorf("trigger %d: %v", idx, err)
+				return
+			}
+			fps[idx] = r.Fingerprint
+			pending[idx] = r.AlertsPending
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for i := 1; i < n; i++ {
+		if fps[i] != fps[0] {
+			t.Fatalf("late batch trigger %d produced a different fingerprint", i)
+		}
+		if pending[i] != pending[0] {
+			t.Fatalf("late batch trigger %d reported a different pending count", i)
+		}
+	}
+	if pending[0] != 1 {
+		t.Fatalf("late batch should have one pending alert, got %d", pending[0])
+	}
+
+	// Channel recovers; a repeat of the late batch fills the backlog once.
+	fx.sink.mu.Lock()
+	fx.sink.failRule = map[string]bool{}
+	fx.sink.mu.Unlock()
+	b, err := eng.Run(context.Background(), "b-100", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Status != "replay" || b.AlertsRetried != 1 || b.AlertsPending != 0 {
+		t.Fatalf("late batch retry accounting wrong: %+v", b)
+	}
+	// Count per (batch, rule) so the newer b-300 alert does not collide with
+	// the late b-100 one.
+	counts := map[string]int{}
+	for _, a := range fx.sink.snapshot() {
+		counts[a.BatchID+"\x00"+a.RuleID]++
+	}
+	for id, c := range counts {
+		if c != 1 {
+			t.Fatalf("combined run duplicated alert %s x%d", id, c)
+		}
+	}
+}
+
+func slicesContain[T comparable](xs []T, want T) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestCrossInstanceSeesLiveBatch opens two engines backed by the same state
+// directory (simulating two processes) and checks that a trigger while the
+// first execution is live is told the batch is already running rather than
+// starting a second evaluation.
+func TestCrossInstanceSeesLiveBatch(t *testing.T) {
+	files := map[string]string{"users.csv": usersCSVOriginal}
+	fx := newFixture(t, files, baseRules(), usersDatasets())
+
+	store1, err := state.NewFileStoreWithTTL(filepath.Join(fx.dir, "state"), 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store1.Close()
+
+	st, replay, err := store1.Begin(context.Background(), "b-live", false)
+	if err != nil || replay {
+		t.Fatalf("begin: replay=%v err=%v", replay, err)
+	}
+	_ = st
+
+	// A second store instance on the same directory sees the live lease.
+	store2same, err := state.NewFileStore(filepath.Join(fx.dir, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store2same.Close()
+	eng2 := New(fx.cfg, datasource.New(""), store2same, fx.alerter, Options{
+		EvalTime: time.Date(2026, 9, 23, 10, 0, 0, 0, time.UTC),
+	})
+	if _, err := eng2.Run(context.Background(), "b-live", false); !errors.Is(err, state.ErrBatchRunning) {
+		t.Fatalf("concurrent cross-instance trigger: want ErrBatchRunning, got %v", err)
+	}
+	// force cannot steal a live lease either.
+	if _, err := eng2.Run(context.Background(), "b-live", true); !errors.Is(err, state.ErrBatchRunning) {
+		t.Fatalf("force on live lease: want ErrBatchRunning, got %v", err)
 	}
 }

@@ -85,9 +85,14 @@ func TestExampleEndToEnd(t *testing.T) {
 		t.Fatalf("replay not reproducible: status=%s fp1=%s fp2=%s", b2.Status, b1.Fingerprint, b2.Fingerprint)
 	}
 
-	// Late arrival of an older batch is rejected, never silently applied.
-	if _, err := eng.Run(ctx, "20260922-999", false); err == nil {
-		t.Fatal("out-of-order older batch must be rejected")
+	// Late arrival of an older, never-processed batch is evaluated normally
+	// and still produces full conclusions (late batches are never dropped).
+	late, err := eng.Run(ctx, "20260922-999", false)
+	if err != nil {
+		t.Fatalf("late-arriving older batch must be accepted: %v", err)
+	}
+	if late.Status != "committed" || len(late.Results) != len(wantStatus) {
+		t.Fatalf("late batch must produce conclusions: status=%s rules=%d", late.Status, len(late.Results))
 	}
 
 	// Historical conclusions remain retrievable by batch id.

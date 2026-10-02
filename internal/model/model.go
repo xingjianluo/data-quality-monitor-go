@@ -2,7 +2,10 @@
 // rule declarations, datasets, normalized verdicts and batch run results.
 package model
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // RuleKind enumerates the supported declarative rule families.
 type RuleKind string
@@ -162,6 +165,53 @@ type BatchResult struct {
 	Status      string       `json:"status"` // committed / replay / aborted
 	Results     []RuleResult `json:"results"`
 	Fingerprint string       `json:"fingerprint"`
+	// Alert delivery accounting. AlertsSent counts notifications delivered
+	// during this run (including retried backlog), AlertsRetried counts how
+	// many of those were backlog from earlier failed deliveries, and
+	// AlertsPending counts notifications still not delivered after this run.
+	AlertsSent    int `json:"alerts_sent"`
+	AlertsRetried int `json:"alerts_retried"`
+	AlertsPending int `json:"alerts_pending"`
+}
+
+// InvalidationSide identifies which side of a batch declaration drifted since
+// the stored conclusions were produced.
+type InvalidationSide string
+
+const (
+	// InvalidatedData means the dataset file content/availability changed.
+	InvalidatedData InvalidationSide = "data"
+	// InvalidatedRules means the rule/dataset declarations or eval time changed.
+	InvalidatedRules InvalidationSide = "rules"
+)
+
+// HistoryInvalidError reports that a batch already has stored conclusions but
+// the current inputs no longer match the ones those conclusions were produced
+// from. Sides lets callers distinguish data drift from rule/declaration drift
+// at a glance; Changes lists every concrete difference deterministically.
+type HistoryInvalidError struct {
+	BatchID string
+	Sides   []InvalidationSide
+	Changes []string
+}
+
+// Error implements error. It never folds the two causes together: the message
+// names both whether the batch was already concluded and, separately, exactly
+// what drifted.
+func (e *HistoryInvalidError) Error() string {
+	sides := make([]string, 0, len(e.Sides))
+	for _, s := range e.Sides {
+		sides = append(sides, string(s))
+	}
+	msg := "batch " + e.BatchID + " already has stored conclusions that no longer apply"
+	if len(sides) > 0 {
+		msg += " (changed side(s): " + strings.Join(sides, ",") + ")"
+	}
+	if len(e.Changes) > 0 {
+		msg += ": " + strings.Join(e.Changes, "; ")
+	}
+	msg += "; historical conclusions are immutable and were not overwritten"
+	return msg
 }
 
 // RuleError is a classifiable engine error carrying a normalized ReasonCode.
