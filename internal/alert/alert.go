@@ -1,9 +1,11 @@
 // Package alert normalizes and deduplicates rule failure notifications.
 //
-// Alerts are emitted exactly once per (batch, rule). Dispatched keys are
-// persisted in an append-only JSONL journal, so a repeated batch, an
-// out-of-order replay or a post-crash re-run never sends duplicate alerts and a
-// crashed dispatch resumes without re-notifying already delivered rules.
+// Alerts are emitted at most once per (batch, rule). Successfully delivered
+// keys are persisted in an append-only JSONL journal, so a repeated batch, a
+// late arrival, a crash restart or a replay never sends duplicates, while
+// keys not yet journaled are retried on every invocation until they succeed
+// (backlog补投). Every Dispatch returns an AlertReport partitioning the
+// expected alerts into already-delivered / sent-this-run / still-pending.
 package alert
 
 import (
@@ -134,38 +136,46 @@ func (a *Alerter) loadDispatched() (map[string]bool, error) {
 // severity. It is idempotent: a (batch, rule) pair already present in the
 // journal is never sent again. Results are processed in order so the journal
 // and output are deterministic.
-func (a *Alerter) Dispatch(ctx context.Context, batchID string, results []model.RuleResult, minSeverity model.Severity) (int, error) {
+//
+// The returned report distinguishes alerts already delivered in earlier
+// invocations (retried batches/crash restarts), alerts delivered in this
+// invocation (including backlog retries) and alerts still pending after it, so
+// callers can tell a retry "补齐了几条、还剩几条".
+func (a *Alerter) Dispatch(ctx context.Context, batchID string, results []model.RuleResult, minSeverity model.Severity) (model.AlertReport, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	dispatched, err := a.loadDispatched()
 	if err != nil {
-		return 0, err
+		return model.AlertReport{}, err
 	}
 	jf, err := os.OpenFile(a.journal, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
-		return 0, err
+		return model.AlertReport{}, err
 	}
 	defer jf.Close()
 
 	ordered := append([]model.RuleResult(nil), results...)
 	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].RuleID < ordered[j].RuleID })
 
-	sent := 0
+	report := model.AlertReport{}
 	var firstErr error
 	for _, res := range ordered {
-		if err := ctx.Err(); err != nil {
-			return sent, err
-		}
 		if res.Status == model.StatusPassed {
 			continue
 		}
 		if !severityAtLeast(res.Severity, minSeverity) {
 			continue
 		}
+		report.Expected++
 		key := batchID + "\x00" + res.RuleID
 		if dispatched[key] {
+			report.AlreadyDelivered++
 			continue // exactly-once across replays/crashes
+		}
+		if err := ctx.Err(); err != nil {
+			report.Pending = report.Expected - report.AlreadyDelivered - report.SentThisRun
+			return report, err
 		}
 		al := Alert{
 			BatchID:  batchID,
@@ -186,14 +196,17 @@ func (a *Alerter) Dispatch(ctx context.Context, batchID string, results []model.
 		// Record delivery before reporting success; on crash the next run
 		// resumes without re-notifying this rule.
 		raw, _ := json.Marshal(journalEntry{BatchID: batchID, RuleID: res.RuleID})
-		if _, err := jf.Write(append(raw, '\n')); err != nil && firstErr == nil {
-			firstErr = err
+		if _, err := jf.Write(append(raw, '\n')); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
 		dispatched[key] = true
-		sent++
+		report.SentThisRun++
 	}
-	return sent, firstErr
+	report.Pending = report.Expected - report.AlreadyDelivered - report.SentThisRun
+	return report, firstErr
 }
 
 func severityAtLeast(got, min model.Severity) bool {

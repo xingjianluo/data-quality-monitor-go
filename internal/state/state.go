@@ -1,5 +1,5 @@
 // Package state provides durable batch state, historical conclusions and
-// idempotent batch transitions with explicit rollback rejection.
+// idempotent batch transitions with explicit rejection of conclusion rewrites.
 //
 // Lifecycle of a batch:
 //
@@ -7,12 +7,18 @@
 //
 // Semantics:
 //
-//   - Repeating a committed batch replays its stored conclusions (idempotent);
-//     the caller compares the fingerprint before deciding whether to re-evaluate.
-//   - A batch left "running" by a crashed process is rejected until force=true
-//     reclaims it (it is never silently continued from a partial middle state).
-//   - Committing a batch older than the high-water mark is a state rollback and
-//     is explicitly rejected; out-of-order arrivals can never move state back.
+//   - Late arrivals are first-class: a batch id that has never been processed
+//     is accepted regardless of its id order relative to already committed
+//     batches. Ordering never causes an unseen batch to be dropped.
+//   - Repeating an already committed batch never overwrites its conclusions.
+//     Begin replays the stored conclusions; the caller verifies the inputs
+//     behind the conclusions are still valid before treating them as current.
+//     force=true on a committed batch is rejected with ErrAlreadyConcluded.
+//   - A batch observed "running" with a live lease returns ErrBatchRunning
+//     (concurrent triggers must wait/share instead of executing twice). A
+//     running batch whose lease has expired is a crash leftover: rejected with
+//     ErrStaleBatch until force=true reclaims it (it is never silently
+//     continued from a partial middle state).
 //   - All updates are atomic (temp file + rename) and process-exclusive (flock).
 package state
 
@@ -40,13 +46,24 @@ const (
 	StatusCommitted BatchStatus = "committed"
 )
 
+// DefaultLeaseTTL is how long a lease stays valid without a heartbeat. A live
+// engine renews periodically; a batch still "running" past its lease expiry is
+// treated as a crash leftover.
+const DefaultLeaseTTL = 30 * time.Second
+
 // Sentinel errors callers can distinguish with errors.Is.
 var (
-	// ErrStaleBatch means a batch is stuck in "running" and must be reclaimed
-	// with force=true before it can run again.
-	ErrStaleBatch = errors.New("batch is in running state from a previous interrupted execution; re-run with force to reclaim it")
-	// ErrRollback means an attempt would move state behind the high-water mark.
-	ErrRollback = errors.New("state rollback rejected: batch is older than the latest committed batch")
+	// ErrAlreadyConcluded means the batch id already has committed conclusions;
+	// historical conclusions are never overwritten. Re-run the same inputs as a
+	// replay, or use a new batch id. It is distinct from ErrBatchRunning and
+	// ErrStaleBatch so the rejection reason is unambiguous.
+	ErrAlreadyConcluded = errors.New("batch already has committed conclusions: historical conclusions cannot be overwritten; re-run replays them or use a new batch id")
+	// ErrBatchRunning means the batch is currently executing under a live lease.
+	// Concurrent triggers must wait for that execution or return its result.
+	ErrBatchRunning = errors.New("batch is currently running under another execution")
+	// ErrStaleBatch means a batch is stuck in "running" with an expired lease
+	// (a crash leftover) and must be reclaimed with force=true.
+	ErrStaleBatch = errors.New("batch is in running state from a previous interrupted execution with an expired lease; re-run with force to reclaim it")
 	// ErrLease means the lease token is missing, stale or already released.
 	ErrLease = errors.New("invalid or expired batch lease")
 	// ErrNotFound means no state exists for the batch.
@@ -55,26 +72,57 @@ var (
 	ErrBusy = errors.New("state store is locked by another operation")
 )
 
+// DatasetInput is the durable fingerprint of one dataset input at commit time.
+type DatasetInput struct {
+	Name        string `json:"name"`
+	Path        string `json:"path"`
+	Format      string `json:"format"`
+	SchemaHash  string `json:"schema_hash"`  // declared schema + dataset declaration
+	ShapeHash   string `json:"shape_hash"`   // fields actually observed in the file
+	ContentHash string `json:"content_hash"` // full file content hash; "missing" if unreadable
+	RecordCount int    `json:"record_count"`
+	LoadError   string `json:"load_error,omitempty"` // normalized code when unreadable/unparseable
+}
+
+// InputSnapshot captures every input behind a committed conclusion so a later
+// replay can tell whether the historical conclusions are still valid, and
+// whether a difference comes from the data side or the rule side.
+type InputSnapshot struct {
+	EvalTime time.Time      `json:"eval_time"`
+	RuleHash string         `json:"rule_hash"`
+	Datasets []DatasetInput `json:"datasets"`
+}
+
 // BatchState is the durable state of one batch.
 type BatchState struct {
 	BatchID     string             `json:"batch_id"`
 	Status      BatchStatus        `json:"status"`
 	LeaseToken  string             `json:"lease_token,omitempty"`
+	LeaseExpiry *time.Time         `json:"lease_expiry,omitempty"`
 	Fingerprint string             `json:"fingerprint,omitempty"`
 	StartedAt   time.Time          `json:"started_at"`
 	UpdatedAt   time.Time          `json:"updated_at"`
 	CommittedAt *time.Time         `json:"committed_at,omitempty"`
 	Results     []model.RuleResult `json:"results,omitempty"`
+	// Inputs is the input snapshot captured at commit time, used for replay
+	// validity checks (data drift vs rule drift).
+	Inputs *InputSnapshot `json:"inputs,omitempty"`
 }
 
 // Store persists batch states and historical conclusions.
 type Store interface {
-	// Begin starts a batch. It returns the state and true when the batch was
-	// already committed (caller should replay the returned conclusions); false
-	// means a fresh "running" lease has been granted.
+	// Begin starts a batch. If the batch was already committed it returns the
+	// stored state and replay=true without modifying anything. A fresh batch
+	// gets a "running" lease. A batch currently executing under a live lease
+	// returns ErrBatchRunning; a crash leftover (expired lease) returns
+	// ErrStaleBatch unless force=true reclaims it.
 	Begin(ctx context.Context, batchID string, force bool) (*BatchState, bool, error)
-	// Commit finalizes a running batch using its lease token.
-	Commit(ctx context.Context, batchID, leaseToken, fingerprint string, results []model.RuleResult) error
+	// Commit finalizes a running batch using its lease token and records the
+	// input snapshot for later replay-validity checks.
+	Commit(ctx context.Context, batchID, leaseToken, fingerprint string, results []model.RuleResult, inputs *InputSnapshot) error
+	// Heartbeat extends the lease of a running batch while it executes, so a
+	// live long-running batch is never mistaken for a crash leftover.
+	Heartbeat(ctx context.Context, batchID, leaseToken string) error
 	// Fail marks a running batch as failed and releases its lease. A failed
 	// batch can only be restarted with force=true.
 	Fail(ctx context.Context, batchID, leaseToken, reason string) error
@@ -89,12 +137,22 @@ type Store interface {
 // FileStore is a file-backed Store.
 type FileStore struct {
 	dir      string
+	leaseTTL time.Duration
 	mu       sync.Mutex
 	lockFile *os.File
 }
 
 // NewFileStore creates (or opens) a file-backed store rooted at dir.
 func NewFileStore(dir string) (Store, error) {
+	return NewFileStoreWithTTL(dir, DefaultLeaseTTL)
+}
+
+// NewFileStoreWithTTL creates a file-backed store with an explicit lease TTL.
+// Mainly useful for tests that need fast crash-leftover detection.
+func NewFileStoreWithTTL(dir string, leaseTTL time.Duration) (Store, error) {
+	if leaseTTL <= 0 {
+		leaseTTL = DefaultLeaseTTL
+	}
 	if err := os.MkdirAll(filepath.Join(dir, "batches"), 0o755); err != nil {
 		return nil, fmt.Errorf("init state dir: %w", err)
 	}
@@ -106,7 +164,7 @@ func NewFileStore(dir string) (Store, error) {
 		lf.Close()
 		return nil, err
 	}
-	return &FileStore{dir: dir, lockFile: lf}, nil
+	return &FileStore{dir: dir, leaseTTL: leaseTTL, lockFile: lf}, nil
 }
 
 func (s *FileStore) Close() error {
@@ -152,29 +210,17 @@ func (s *FileStore) write(st *BatchState) error {
 	return nil
 }
 
-// highWater returns the lexicographically greatest committed batch id.
-// Batch ids are ordered (e.g. timestamps/sequence numbers) so the greatest id
-// is the most recently committed batch.
-func (s *FileStore) highWater() (string, error) {
-	entries, err := os.ReadDir(filepath.Join(s.dir, "batches"))
-	if err != nil {
-		return "", err
+// leaseLive reports whether a running batch still holds an unexpired lease. A
+// running state with no token (Fail was called) or a past expiry is a crash
+// leftover.
+func (s *FileStore) leaseLive(st *BatchState, now time.Time) bool {
+	if st.Status != StatusRunning || st.LeaseToken == "" {
+		return false
 	}
-	hw := ""
-	for _, e := range entries {
-		name := e.Name()
-		if filepath.Ext(name) != ".json" {
-			continue
-		}
-		st, err := s.read(name[:len(name)-len(".json")])
-		if err != nil {
-			return "", err
-		}
-		if st.Status == StatusCommitted && st.BatchID > hw {
-			hw = st.BatchID
-		}
+	if st.LeaseExpiry == nil {
+		return false
 	}
-	return hw, nil
+	return st.LeaseExpiry.After(now)
 }
 
 func newLeaseToken() string {
@@ -193,23 +239,23 @@ func (s *FileStore) Begin(ctx context.Context, batchID string, force bool) (*Bat
 		return nil, false, err
 	}
 
-	hw, err := s.highWater()
-	if err != nil {
-		return nil, false, err
-	}
-	if hw != "" && batchID < hw {
-		return nil, false, fmt.Errorf("%w: %s < %s", ErrRollback, batchID, hw)
-	}
-
 	st, err := s.read(batchID)
 	switch {
 	case errors.Is(err, ErrNotFound):
-		// fresh batch
+		// Unseen batch — including an older id arriving late. Accepted.
 	case err != nil:
 		return nil, false, err
 	default:
 		if st.Status == StatusCommitted {
+			// Historical conclusions are immutable: a replay never overwrites
+			// them, and force cannot reclaim a committed batch.
+			if force {
+				return nil, false, fmt.Errorf("%w: batch %s", ErrAlreadyConcluded, batchID)
+			}
 			return st, true, nil
+		}
+		if s.leaseLive(st, time.Now().UTC()) {
+			return nil, false, fmt.Errorf("%w: batch %s", ErrBatchRunning, batchID)
 		}
 		if !force {
 			return nil, false, fmt.Errorf("%w: batch %s", ErrStaleBatch, batchID)
@@ -218,13 +264,15 @@ func (s *FileStore) Begin(ctx context.Context, batchID string, force bool) (*Bat
 	}
 
 	now := time.Now().UTC()
+	expiry := now.Add(s.leaseTTL)
 	fresh := &BatchState{
-		BatchID:    batchID,
-		Status:     StatusRunning,
-		LeaseToken: newLeaseToken(),
-		StartedAt:  now,
-		UpdatedAt:  now,
-		Results:    []model.RuleResult{},
+		BatchID:     batchID,
+		Status:      StatusRunning,
+		LeaseToken:  newLeaseToken(),
+		LeaseExpiry: &expiry,
+		StartedAt:   now,
+		UpdatedAt:   now,
+		Results:     []model.RuleResult{},
 	}
 	if err := s.write(fresh); err != nil {
 		return nil, false, err
@@ -232,22 +280,19 @@ func (s *FileStore) Begin(ctx context.Context, batchID string, force bool) (*Bat
 	return fresh, false, nil
 }
 
-func (s *FileStore) Commit(ctx context.Context, batchID, leaseToken, fingerprint string, results []model.RuleResult) error {
+func (s *FileStore) Commit(ctx context.Context, batchID, leaseToken, fingerprint string, results []model.RuleResult, inputs *InputSnapshot) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	hw, err := s.highWater()
-	if err != nil {
-		return err
-	}
-	if hw != "" && batchID < hw {
-		return fmt.Errorf("%w: %s < %s", ErrRollback, batchID, hw)
-	}
 	st, err := s.read(batchID)
 	if err != nil {
 		return err
+	}
+	if st.Status == StatusCommitted {
+		// Never overwrite an existing conclusion, even with a token.
+		return fmt.Errorf("%w: batch %s already committed", ErrAlreadyConcluded, batchID)
 	}
 	if st.Status != StatusRunning {
 		return fmt.Errorf("%w: batch %s is %s, not running", ErrLease, batchID, st.Status)
@@ -258,12 +303,32 @@ func (s *FileStore) Commit(ctx context.Context, batchID, leaseToken, fingerprint
 	now := time.Now().UTC()
 	st.Status = StatusCommitted
 	st.LeaseToken = ""
+	st.LeaseExpiry = nil
 	st.Fingerprint = fingerprint
 	st.CommittedAt = &now
 	if results == nil {
 		results = []model.RuleResult{}
 	}
 	st.Results = results
+	st.Inputs = inputs
+	return s.write(st)
+}
+
+func (s *FileStore) Heartbeat(ctx context.Context, batchID, leaseToken string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	st, err := s.read(batchID)
+	if err != nil {
+		return err
+	}
+	if st.Status != StatusRunning || st.LeaseToken == "" || st.LeaseToken != leaseToken {
+		return fmt.Errorf("%w: cannot heartbeat batch %s", ErrLease, batchID)
+	}
+	expiry := time.Now().UTC().Add(s.leaseTTL)
+	st.LeaseExpiry = &expiry
 	return s.write(st)
 }
 
@@ -283,6 +348,7 @@ func (s *FileStore) Fail(ctx context.Context, batchID, leaseToken, reason string
 	// A failed batch keeps status "running" with an emptied lease so it cannot
 	// be silently continued; force=true in Begin is required to reclaim it.
 	st.LeaseToken = ""
+	st.LeaseExpiry = nil
 	st.Fingerprint = "__failed__:" + reason
 	st.Results = []model.RuleResult{}
 	return s.write(st)

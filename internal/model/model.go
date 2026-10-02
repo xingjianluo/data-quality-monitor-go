@@ -162,6 +162,24 @@ type BatchResult struct {
 	Status      string       `json:"status"` // committed / replay / aborted
 	Results     []RuleResult `json:"results"`
 	Fingerprint string       `json:"fingerprint"`
+	// AlertReport summarizes notification delivery for this invocation,
+	// including retried (newly delivered on a replay) and still-pending alerts.
+	AlertReport AlertReport `json:"alert_report"`
+}
+
+// AlertReport explains notification delivery for one invocation.
+//
+//   - Expected: alerts that should exist for the batch conclusions (distinct
+//     failed/errored rules at or above the minimum severity).
+//   - AlreadyDelivered: already journaled before this invocation (not re-sent).
+//   - SentThisRun: successfully delivered during this invocation, including
+//     retries that completed an earlier partial/failed dispatch.
+//   - Pending: still not successfully delivered after this invocation.
+type AlertReport struct {
+	Expected         int `json:"expected"`
+	AlreadyDelivered int `json:"already_delivered"`
+	SentThisRun      int `json:"sent_this_run"`
+	Pending          int `json:"pending"`
 }
 
 // RuleError is a classifiable engine error carrying a normalized ReasonCode.

@@ -177,3 +177,46 @@ func hasShapeCode(issues []ShapeIssue, code model.ReasonCode) bool {
 	}
 	return false
 }
+
+func TestInspectFingerprintsContentShapeAndMissing(t *testing.T) {
+	dir := t.TempDir()
+	l := New("")
+	ctx := context.Background()
+	p := writeFile(t, dir, "users.csv", "id,name\n1,A\n2,B\n")
+	decl := csvDecl(p)
+
+	fp1 := l.Inspect(ctx, decl)
+	if fp1.ContentHash == "" || fp1.ContentHash == "missing" || fp1.ShapeHash == "" {
+		t.Fatalf("invalid fingerprint: %+v", fp1)
+	}
+	if fp1.Records != 2 || fp1.LoadCode != model.ReasonNone {
+		t.Fatalf("want 2 readable records, got %+v", fp1)
+	}
+	// Deterministic: same file inspects identically.
+	if got := l.Inspect(ctx, decl); got != fp1 {
+		t.Fatalf("fingerprint not stable: %+v vs %+v", got, fp1)
+	}
+	// Same shape, different rows: content hash changes, shape hash stays.
+	p2 := writeFile(t, dir, "users2.csv", "id,name\n1,A\n3,C\n")
+	fp2 := l.Inspect(ctx, csvDecl(p2))
+	if fp2.ContentHash == fp1.ContentHash {
+		t.Fatal("content hash must change when rows change")
+	}
+	if fp2.ShapeHash != fp1.ShapeHash {
+		t.Fatal("shape hash must be identical for identical shapes")
+	}
+	// Different column set: shape hash changes.
+	p3 := writeFile(t, dir, "users3.csv", "id,name,extra\n1,A,x\n2,B,y\n")
+	fp3 := l.Inspect(ctx, csvDecl(p3))
+	if fp3.ShapeHash == fp1.ShapeHash {
+		t.Fatal("shape hash must change when columns change")
+	}
+	// Deleted file: missing content + normalized load code, no error.
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	fp4 := l.Inspect(ctx, decl)
+	if fp4.ContentHash != "missing" || fp4.LoadCode != model.ReasonSourceLoadFailure {
+		t.Fatalf("missing file fingerprint: %+v", fp4)
+	}
+}

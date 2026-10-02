@@ -12,7 +12,9 @@ package datasource
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,6 +31,23 @@ import (
 type ShapeIssue struct {
 	Code   model.ReasonCode
 	Detail string
+}
+
+// Fingerprint is the durable identity of a dataset input at one point in time.
+// It lets a later replay decide whether historical conclusions still describe
+// the current inputs and, when they do not, whether the difference is
+// structural (shape/schema), content-level or a missing/unreadable source.
+type Fingerprint struct {
+	// ContentHash is SHA256 of the raw file bytes; "missing" when unreadable.
+	ContentHash string
+	// ShapeHash is SHA256 of format + ordered actual field names + record count;
+	// "unparseable" when the file could be read but not parsed.
+	ShapeHash string
+	// Records is the number of parsed records (0 when unparseable).
+	Records int
+	// LoadCode is a normalized ReasonCode when the source was missing or could
+	// not be parsed (model.ReasonSourceLoadFailure), empty on success.
+	LoadCode model.ReasonCode
 }
 
 // Loader loads datasets from local files.
@@ -52,19 +71,53 @@ func (l *Loader) Load(ctx context.Context, decl model.DatasetDecl) (*model.Datas
 		return nil, nil, fmt.Errorf("read %s: %w", decl.Name, err)
 	}
 	var ds *model.Dataset
-	switch decl.Format {
-	case "csv":
-		ds, err = l.loadCSV(ctx, decl, data)
-	case "jsonl":
-		ds, err = l.loadJSONL(ctx, decl, data)
-	default:
-		return nil, nil, fmt.Errorf("dataset %s: unsupported format %q", decl.Name, decl.Format)
-	}
+	ds, err = l.parse(ctx, decl, data)
 	if err != nil {
 		return nil, nil, err
 	}
 	issues := diffShape(decl, ds)
 	return ds, issues, nil
+}
+
+// Inspect computes a stable fingerprint of the declared dataset's current
+// source without applying any rules. It never returns an error: an unreadable
+// or unparseable source is reported through the Fingerprint.LoadCode so replay
+// validity checks can classify a deleted/swapped/corrupted source file.
+func (l *Loader) Inspect(ctx context.Context, decl model.DatasetDecl) Fingerprint {
+	path := decl.Path
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(l.baseDir, path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Fingerprint{ContentHash: "missing", ShapeHash: "missing", LoadCode: model.ReasonSourceLoadFailure}
+	}
+	sum := sha256.Sum256(data)
+	fp := Fingerprint{ContentHash: hex.EncodeToString(sum[:])}
+	ds, perr := l.parse(ctx, decl, data)
+	if perr != nil {
+		fp.ShapeHash = "unparseable"
+		fp.LoadCode = model.ReasonSourceLoadFailure
+		return fp
+	}
+	shapeParts := append([]string{decl.Format}, ds.Actual...)
+	shapeParts = append(shapeParts, fmt.Sprintf("records=%d", len(ds.Records)))
+	ssum := sha256.Sum256([]byte(strings.Join(shapeParts, "\x00")))
+	fp.ShapeHash = hex.EncodeToString(ssum[:])
+	fp.Records = len(ds.Records)
+	return fp
+}
+
+// parse loads without shape diffing, used both by Load and Inspect.
+func (l *Loader) parse(ctx context.Context, decl model.DatasetDecl, data []byte) (*model.Dataset, error) {
+	switch decl.Format {
+	case "csv":
+		return l.loadCSV(ctx, decl, data)
+	case "jsonl":
+		return l.loadJSONL(ctx, decl, data)
+	default:
+		return nil, fmt.Errorf("dataset %s: unsupported format %q", decl.Name, decl.Format)
+	}
 }
 
 func diffShape(decl model.DatasetDecl, ds *model.Dataset) []ShapeIssue {

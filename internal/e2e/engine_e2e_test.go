@@ -85,17 +85,37 @@ func TestExampleEndToEnd(t *testing.T) {
 		t.Fatalf("replay not reproducible: status=%s fp1=%s fp2=%s", b2.Status, b1.Fingerprint, b2.Fingerprint)
 	}
 
-	// Late arrival of an older batch is rejected, never silently applied.
-	if _, err := eng.Run(ctx, "20260922-999", false); err == nil {
-		t.Fatal("out-of-order older batch must be rejected")
+	// Late arrival of an older, never-processed batch is accepted and produces
+	// its own conclusions and history; it never displaces the newer batch.
+	late, err := eng.Run(ctx, "20260922-999", false)
+	if err != nil {
+		t.Fatalf("late unseen batch must be accepted, got %v", err)
+	}
+	if late.Status != "committed" || len(late.Results) != len(wantStatus) {
+		t.Fatalf("late batch conclusions missing: status=%s results=%d", late.Status, len(late.Results))
+	}
+	// Repeating the late batch replays it (inputs unchanged), no overwrite.
+	lateReplay, err := eng.Run(ctx, "20260922-999", false)
+	if err != nil {
+		t.Fatalf("late batch replay: %v", err)
+	}
+	if lateReplay.Status != "replay" || lateReplay.Fingerprint != late.Fingerprint {
+		t.Fatalf("late batch replay not reproducible: %s vs %s", lateReplay.Fingerprint, late.Fingerprint)
 	}
 
-	// Historical conclusions remain retrievable by batch id.
+	// Both histories coexist; the original newer batch is untouched.
 	st, err := store.Get(ctx, "20260923-001")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if st.Status != state.StatusCommitted || len(st.Results) != len(wantStatus) {
 		t.Fatalf("stored history mismatch: %+v", st)
+	}
+	stLate, err := store.Get(ctx, "20260922-999")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stLate.Status != state.StatusCommitted || stLate.Fingerprint == st.Fingerprint {
+		t.Fatalf("late batch history must be independent: %+v", stLate)
 	}
 }
