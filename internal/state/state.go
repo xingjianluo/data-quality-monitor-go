@@ -19,7 +19,11 @@
 //     running batch whose lease has expired is a crash leftover: rejected with
 //     ErrStaleBatch until force=true reclaims it (it is never silently
 //     continued from a partial middle state).
-//   - All updates are atomic (temp file + rename) and process-exclusive (flock).
+//   - All updates are atomic (temp file + rename). Mutual exclusion is
+//     per-batch: each batch id has its own lock file (flock) plus an
+//     in-process keyed mutex, so concurrent processes/operations on
+//     *different* batches — and read-only Get/List queries — never block
+//     each other, while the same batch is still serialized exactly once.
 package state
 
 import (
@@ -68,8 +72,6 @@ var (
 	ErrLease = errors.New("invalid or expired batch lease")
 	// ErrNotFound means no state exists for the batch.
 	ErrNotFound = errors.New("batch not found")
-	// ErrBusy means another operation currently holds the store lock.
-	ErrBusy = errors.New("state store is locked by another operation")
 )
 
 // DatasetInput is the durable fingerprint of one dataset input at commit time.
@@ -138,8 +140,13 @@ type Store interface {
 type FileStore struct {
 	dir      string
 	leaseTTL time.Duration
-	mu       sync.Mutex
-	lockFile *os.File
+
+	// mu guards batchMu; batchMu serializes operations on one batch id within
+	// this process. Cross-process exclusion comes from the per-batch lock
+	// file taken inside withBatchLock. There is deliberately no store-wide
+	// lock: unrelated batches and read-only queries proceed in parallel.
+	mu      sync.Mutex
+	batchMu map[string]*sync.Mutex
 }
 
 // NewFileStore creates (or opens) a file-backed store rooted at dir.
@@ -149,6 +156,10 @@ func NewFileStore(dir string) (Store, error) {
 
 // NewFileStoreWithTTL creates a file-backed store with an explicit lease TTL.
 // Mainly useful for tests that need fast crash-leftover detection.
+//
+// Opening a store never takes a global lock, so any number of processes may
+// hold a store on the same directory at once (e.g. one process running a
+// batch while another serves read-only history queries).
 func NewFileStoreWithTTL(dir string, leaseTTL time.Duration) (Store, error) {
 	if leaseTTL <= 0 {
 		leaseTTL = DefaultLeaseTTL
@@ -156,27 +167,44 @@ func NewFileStoreWithTTL(dir string, leaseTTL time.Duration) (Store, error) {
 	if err := os.MkdirAll(filepath.Join(dir, "batches"), 0o755); err != nil {
 		return nil, fmt.Errorf("init state dir: %w", err)
 	}
-	lf, err := os.OpenFile(filepath.Join(dir, "lock"), os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return nil, fmt.Errorf("open state lock: %w", err)
-	}
-	if err := lockFile(lf); err != nil {
-		lf.Close()
-		return nil, err
-	}
-	return &FileStore{dir: dir, leaseTTL: leaseTTL, lockFile: lf}, nil
+	return &FileStore{dir: dir, leaseTTL: leaseTTL, batchMu: map[string]*sync.Mutex{}}, nil
 }
 
-func (s *FileStore) Close() error {
-	if s.lockFile == nil {
-		return nil
-	}
-	_ = unlockFile(s.lockFile)
-	return s.lockFile.Close()
-}
+func (s *FileStore) Close() error { return nil }
 
 func (s *FileStore) batchPath(id string) string {
 	return filepath.Join(s.dir, "batches", id+".json")
+}
+
+func (s *FileStore) lockPath(id string) string {
+	return filepath.Join(s.dir, "batches", id+".lock")
+}
+
+// withBatchLock runs fn while holding the per-batch in-process mutex and the
+// per-batch flock, serializing read-modify-write cycles for one batch id
+// across goroutines and processes. Other batch ids are unaffected.
+func (s *FileStore) withBatchLock(id string, fn func() error) error {
+	s.mu.Lock()
+	bm, ok := s.batchMu[id]
+	if !ok {
+		bm = &sync.Mutex{}
+		s.batchMu[id] = bm
+	}
+	s.mu.Unlock()
+
+	bm.Lock()
+	defer bm.Unlock()
+
+	lf, err := os.OpenFile(s.lockPath(id), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return fmt.Errorf("open batch lock %s: %w", id, err)
+	}
+	defer lf.Close()
+	if err := lockFile(lf); err != nil {
+		return fmt.Errorf("acquire batch lock %s: %w", id, err)
+	}
+	defer unlockFile(lf)
+	return fn()
 }
 
 func (s *FileStore) read(id string) (*BatchState, error) {
@@ -233,12 +261,24 @@ func (s *FileStore) Begin(ctx context.Context, batchID string, force bool) (*Bat
 	if batchID == "" {
 		return nil, false, errors.New("empty batch id")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
+	var out *BatchState
+	var replay bool
+	err := s.withBatchLock(batchID, func() error {
+		var err error
+		out, replay, err = s.beginLocked(batchID, force)
+		return err
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return out, replay, nil
+}
 
+// beginLocked is Begin's body; the caller must hold the per-batch lock.
+func (s *FileStore) beginLocked(batchID string, force bool) (*BatchState, bool, error) {
 	st, err := s.read(batchID)
 	switch {
 	case errors.Is(err, ErrNotFound):
@@ -281,91 +321,92 @@ func (s *FileStore) Begin(ctx context.Context, batchID string, force bool) (*Bat
 }
 
 func (s *FileStore) Commit(ctx context.Context, batchID, leaseToken, fingerprint string, results []model.RuleResult, inputs *InputSnapshot) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	st, err := s.read(batchID)
-	if err != nil {
-		return err
-	}
-	if st.Status == StatusCommitted {
-		// Never overwrite an existing conclusion, even with a token.
-		return fmt.Errorf("%w: batch %s already committed", ErrAlreadyConcluded, batchID)
-	}
-	if st.Status != StatusRunning {
-		return fmt.Errorf("%w: batch %s is %s, not running", ErrLease, batchID, st.Status)
-	}
-	if st.LeaseToken == "" || st.LeaseToken != leaseToken {
-		return fmt.Errorf("%w: lease mismatch for batch %s", ErrLease, batchID)
-	}
-	now := time.Now().UTC()
-	st.Status = StatusCommitted
-	st.LeaseToken = ""
-	st.LeaseExpiry = nil
-	st.Fingerprint = fingerprint
-	st.CommittedAt = &now
-	if results == nil {
-		results = []model.RuleResult{}
-	}
-	st.Results = results
-	st.Inputs = inputs
-	return s.write(st)
+	return s.withBatchLock(batchID, func() error {
+		st, err := s.read(batchID)
+		if err != nil {
+			return err
+		}
+		if st.Status == StatusCommitted {
+			// Never overwrite an existing conclusion, even with a token.
+			return fmt.Errorf("%w: batch %s already committed", ErrAlreadyConcluded, batchID)
+		}
+		if st.Status != StatusRunning {
+			return fmt.Errorf("%w: batch %s is %s, not running", ErrLease, batchID, st.Status)
+		}
+		if st.LeaseToken == "" || st.LeaseToken != leaseToken {
+			return fmt.Errorf("%w: lease mismatch for batch %s", ErrLease, batchID)
+		}
+		now := time.Now().UTC()
+		st.Status = StatusCommitted
+		st.LeaseToken = ""
+		st.LeaseExpiry = nil
+		st.Fingerprint = fingerprint
+		st.CommittedAt = &now
+		if results == nil {
+			results = []model.RuleResult{}
+		}
+		st.Results = results
+		st.Inputs = inputs
+		return s.write(st)
+	})
 }
 
 func (s *FileStore) Heartbeat(ctx context.Context, batchID, leaseToken string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	st, err := s.read(batchID)
-	if err != nil {
-		return err
-	}
-	if st.Status != StatusRunning || st.LeaseToken == "" || st.LeaseToken != leaseToken {
-		return fmt.Errorf("%w: cannot heartbeat batch %s", ErrLease, batchID)
-	}
-	expiry := time.Now().UTC().Add(s.leaseTTL)
-	st.LeaseExpiry = &expiry
-	return s.write(st)
+	return s.withBatchLock(batchID, func() error {
+		st, err := s.read(batchID)
+		if err != nil {
+			return err
+		}
+		if st.Status != StatusRunning || st.LeaseToken == "" || st.LeaseToken != leaseToken {
+			return fmt.Errorf("%w: cannot heartbeat batch %s", ErrLease, batchID)
+		}
+		expiry := time.Now().UTC().Add(s.leaseTTL)
+		st.LeaseExpiry = &expiry
+		return s.write(st)
+	})
 }
 
 func (s *FileStore) Fail(ctx context.Context, batchID, leaseToken, reason string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	st, err := s.read(batchID)
-	if err != nil {
-		return err
-	}
-	if st.Status != StatusRunning || st.LeaseToken != leaseToken {
-		return fmt.Errorf("%w: cannot fail batch %s", ErrLease, batchID)
-	}
-	// A failed batch keeps status "running" with an emptied lease so it cannot
-	// be silently continued; force=true in Begin is required to reclaim it.
-	st.LeaseToken = ""
-	st.LeaseExpiry = nil
-	st.Fingerprint = "__failed__:" + reason
-	st.Results = []model.RuleResult{}
-	return s.write(st)
+	return s.withBatchLock(batchID, func() error {
+		st, err := s.read(batchID)
+		if err != nil {
+			return err
+		}
+		if st.Status != StatusRunning || st.LeaseToken != leaseToken {
+			return fmt.Errorf("%w: cannot fail batch %s", ErrLease, batchID)
+		}
+		// A failed batch keeps status "running" with an emptied lease so it cannot
+		// be silently continued; force=true in Begin is required to reclaim it.
+		st.LeaseToken = ""
+		st.LeaseExpiry = nil
+		st.Fingerprint = "__failed__:" + reason
+		st.Results = []model.RuleResult{}
+		return s.write(st)
+	})
 }
 
+// Get returns the state of one batch. It is read-only and takes no lock:
+// batch files are replaced atomically (tmp + rename), so a reader always sees
+// a complete snapshot even while another process is mid-run on that batch.
 func (s *FileStore) Get(ctx context.Context, batchID string) (*BatchState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	return s.read(batchID)
 }
 
+// List returns historical batch states in deterministic order. Like Get it is
+// lock-free and never blocked by (nor blocks) batches currently running.
 func (s *FileStore) List(ctx context.Context) ([]BatchState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

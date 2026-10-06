@@ -3,18 +3,17 @@
 package state
 
 import (
-	"errors"
-	"fmt"
 	"os"
 	"syscall"
 )
 
+// lockFile takes a blocking exclusive flock on f. Critical sections guarded by
+// it are single-file read-modify-write cycles (microseconds), so a blocking
+// lock is appropriate: concurrent processes queue instead of failing, which is
+// what lets unrelated batches and read-only queries proceed independently.
 func lockFile(f *os.File) error {
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		if errors.Is(err, syscall.EWOULDBLOCK) {
-			return fmt.Errorf("%w", ErrBusy)
-		}
-		return fmt.Errorf("acquire state lock: %w", err)
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return err
 	}
 	return nil
 }

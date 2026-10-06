@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -223,6 +224,140 @@ func TestListIsOrderedAndReproducible(t *testing.T) {
 	for i, w := range want {
 		if list[i].BatchID != w {
 			t.Fatalf("position %d: want %s got %s", i, w, list[i].BatchID)
+		}
+	}
+}
+
+// TestSecondStoreInstanceOpensWhileAnotherIsLive simulates two processes
+// sharing one state directory: opening a second store must succeed even while
+// the first holds a live lease on some batch.
+func TestSecondStoreInstanceOpensWhileAnotherIsLive(t *testing.T) {
+	dir := t.TempDir()
+	s1, err := NewFileStoreWithTTL(dir, 30*time.Second)
+	if err != nil {
+		t.Fatalf("first store: %v", err)
+	}
+	defer s1.Close()
+	s2, err := NewFileStoreWithTTL(dir, 30*time.Second)
+	if err != nil {
+		t.Fatalf("second store on the same dir must open while the first is live: %v", err)
+	}
+	defer s2.Close()
+	s1.Close()
+	s2.Close()
+}
+
+// TestUnrelatedBatchesAndReadsProceedWhileOneBatchRuns verifies that a live
+// running batch neither blocks other batches nor read-only queries, across
+// two store instances (i.e. two processes).
+func TestUnrelatedBatchesAndReadsProceedWhileOneBatchRuns(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	s1, err := NewFileStoreWithTTL(dir, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s1.Close()
+	s2, err := NewFileStoreWithTTL(dir, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+
+	// Process 1 starts batch-a and keeps it running.
+	stA, _, err := s1.Begin(ctx, "batch-a", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stA.LeaseToken == "" {
+		t.Fatal("expected live lease on batch-a")
+	}
+
+	// Process 2 sees batch-a running...
+	if _, _, err := s2.Begin(ctx, "batch-a", false); !errors.Is(err, ErrBatchRunning) {
+		t.Fatalf("same batch from another process: want ErrBatchRunning, got %v", err)
+	}
+	// ...but runs an unrelated batch to completion without interference.
+	stB, _, err := s2.Begin(ctx, "batch-b", false)
+	if err != nil {
+		t.Fatalf("unrelated batch must begin while batch-a runs: %v", err)
+	}
+	if err := s2.Commit(ctx, "batch-b", stB.LeaseToken, "fp-b", sampleResults(), nil); err != nil {
+		t.Fatalf("unrelated batch must commit while batch-a runs: %v", err)
+	}
+	// ...and read-only queries work from either process at any time.
+	if _, err := s2.Get(ctx, "batch-a"); err != nil {
+		t.Fatalf("Get of the running batch must not be blocked: %v", err)
+	}
+	list, err := s2.List(ctx)
+	if err != nil {
+		t.Fatalf("List must not be blocked by a running batch: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("want 2 batches listed, got %d", len(list))
+	}
+	// Process 1 can still finish its own batch.
+	if err := s1.Commit(ctx, "batch-a", stA.LeaseToken, "fp-a", sampleResults(), nil); err != nil {
+		t.Fatalf("commit batch-a: %v", err)
+	}
+}
+
+// TestConcurrentBeginAcrossInstancesExactlyOneLease races two store instances
+// (two processes) on the same fresh batch id: exactly one may win the lease;
+// the other must observe ErrBatchRunning. There must never be two owners.
+func TestConcurrentBeginAcrossInstancesExactlyOneLease(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	s1, err := NewFileStoreWithTTL(dir, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s1.Close()
+	s2, err := NewFileStoreWithTTL(dir, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+
+	const attempts = 20
+	for round := 0; round < attempts; round++ {
+		id := "race-" + string(rune('a'+round))
+		type outcome struct {
+			st     *BatchState
+			replay bool
+			err    error
+		}
+		res := make([]outcome, 2)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i, s := range []Store{s1, s2} {
+			wg.Add(1)
+			go func(i int, s Store) {
+				defer wg.Done()
+				<-start
+				res[i].st, res[i].replay, res[i].err = s.Begin(ctx, id, false)
+			}(i, s)
+		}
+		close(start)
+		wg.Wait()
+
+		leases, runnings := 0, 0
+		for _, r := range res {
+			if r.err == nil {
+				if r.replay {
+					t.Fatalf("round %d: fresh batch must not replay", round)
+				}
+				leases++
+				continue
+			}
+			if errors.Is(r.err, ErrBatchRunning) {
+				runnings++
+				continue
+			}
+			t.Fatalf("round %d: unexpected error %v", round, r.err)
+		}
+		if leases != 1 || runnings != 1 {
+			t.Fatalf("round %d: want exactly 1 lease + 1 ErrBatchRunning, got %d/%d", round, leases, runnings)
 		}
 	}
 }

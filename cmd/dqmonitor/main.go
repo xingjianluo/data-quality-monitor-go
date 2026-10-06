@@ -94,7 +94,7 @@ func parseCommon(args []string, needConfig bool) (*flag.FlagSet, *commonFlags) {
 	fs.StringVar(&cf.stateDir, "state-dir", ".dq-state", "directory for durable state and journals")
 	fs.StringVar(&cf.alertFile, "alert-file", "", "alert JSONL file (default <state-dir>/alerts.jsonl)")
 	fs.StringVar(&cf.config, "config", "config.json", "path to declarative JSON config")
-	fs.StringVar(&cf.batchID, "batch-id", "", "batch identifier (must be monotonically ordered)")
+	fs.StringVar(&cf.batchID, "batch-id", "", "batch identifier (any order; late arrivals are accepted)")
 	fs.BoolVar(&cf.force, "force", false, "reclaim a stale running batch after an interrupted execution")
 	fs.StringVar(&cf.evalTime, "eval-time", "", "deterministic evaluation time (RFC3339); defaults to now")
 	_ = fs.Parse(args)
