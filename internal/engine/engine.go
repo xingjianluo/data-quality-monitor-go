@@ -322,6 +322,9 @@ func (e *Engine) dispatchAlerts(ctx context.Context, batchID string, results []m
 	if e.alerter == nil {
 		return model.AlertReport{}
 	}
+	// Surface the per-alert decision basis (already delivered / crash
+	// recovered duplicate suppressed / newly sent / failed and left pending).
+	e.alerter.SetLogger(log)
 	report, alertErr := e.alerter.Dispatch(ctx, batchID, results, model.SeverityWarning)
 	if alertErr != nil {
 		log.Error("alert dispatch partially failed",

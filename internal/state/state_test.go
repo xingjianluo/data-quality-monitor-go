@@ -226,3 +226,94 @@ func TestListIsOrderedAndReproducible(t *testing.T) {
 		}
 	}
 }
+
+// TestDifferentBatchesDoNotBlockEachOther opens two independent FileStore
+// handles on the same directory, the way two OS processes would. While one
+// process holds a live lease on batch A, the other process must be able to run
+// a different batch B to completion and to read history, without --force and
+// without ErrBusy/ErrBatchRunning.
+func TestDifferentBatchesDoNotBlockEachOther(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	s1, err := NewFileStoreWithTTL(dir, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s1.Close() })
+
+	// A second "process": a separate handle on the same state dir. The old
+	// implementation failed here immediately with ErrBusy because of the
+	// process-lifetime global flock.
+	s2, err := NewFileStoreWithTTL(dir, 30*time.Second)
+	if err != nil {
+		t.Fatalf("second store handle on same dir must not fail: %v", err)
+	}
+	t.Cleanup(func() { _ = s2.Close() })
+
+	// Process 1 starts batch A and keeps it running (live lease).
+	a, replay, err := s1.Begin(ctx, "batch-A", false)
+	if err != nil || replay {
+		t.Fatalf("begin A: %v replay=%v", err, replay)
+	}
+
+	// Process 2 must see A as running ...
+	if _, _, err := s2.Begin(ctx, "batch-A", false); !errors.Is(err, ErrBatchRunning) {
+		t.Fatalf("A concurrently: expected ErrBatchRunning, got %v", err)
+	}
+	// ... but an unrelated batch B proceeds fully independently.
+	b, replay, err := s2.Begin(ctx, "batch-B", false)
+	if err != nil || replay {
+		t.Fatalf("unrelated batch B must run while A is live: %v replay=%v", err, replay)
+	}
+	if err := s2.Commit(ctx, "batch-B", b.LeaseToken, "fp-B", sampleResults(), nil); err != nil {
+		t.Fatalf("commit B while A live: %v", err)
+	}
+
+	// Read-only queries never block on the running batch.
+	got, err := s2.Get(ctx, "batch-B")
+	if err != nil || got.Status != StatusCommitted {
+		t.Fatalf("Get B: %v status=%v", err, got)
+	}
+	list, err := s2.List(ctx)
+	if err != nil || len(list) != 2 {
+		t.Fatalf("history while A running: %v len=%d", err, len(list))
+	}
+
+	// Process 1 can still finish A afterwards (different lock from B).
+	if err := s1.Commit(ctx, "batch-A", a.LeaseToken, "fp-A", sampleResults(), nil); err != nil {
+		t.Fatalf("commit A: %v", err)
+	}
+}
+
+// TestSameBatchLockSerializesAcrossHandles ensures the per-batch lock itself
+// is honored across two handles: two simultaneous Begin+Commit sequences on the
+// SAME id can never produce two different committed leases.
+func TestSameBatchLockSerializesAcrossHandles(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	s1, _ := NewFileStoreWithTTL(dir, time.Minute)
+	s2, _ := NewFileStoreWithTTL(dir, time.Minute)
+	t.Cleanup(func() { _ = s1.Close(); _ = s2.Close() })
+
+	st1, replay1, err := s1.Begin(ctx, "x", false)
+	if err != nil || replay1 {
+		t.Fatalf("s1 begin: %v %v", err, replay1)
+	}
+	// s2 cannot start while the lease is live.
+	if _, _, err := s2.Begin(ctx, "x", false); !errors.Is(err, ErrBatchRunning) {
+		t.Fatalf("s2 concurrent begin: %v", err)
+	}
+	// A stale/wrong token from s2 cannot hijack s1's commit.
+	if err := s2.Commit(ctx, "x", "deadbeef", "fp-hijack", nil, nil); !errors.Is(err, ErrLease) {
+		t.Fatalf("hijack commit expected ErrLease, got %v", err)
+	}
+	if err := s1.Commit(ctx, "x", st1.LeaseToken, "fp-real", sampleResults(), nil); err != nil {
+		t.Fatalf("s1 commit: %v", err)
+	}
+	// After commit, s2 replays the one real conclusion.
+	got, replay, err := s2.Begin(ctx, "x", false)
+	if err != nil || !replay || got.Fingerprint != "fp-real" {
+		t.Fatalf("s2 replay: %v replay=%v fp=%s", err, replay, got.Fingerprint)
+	}
+}

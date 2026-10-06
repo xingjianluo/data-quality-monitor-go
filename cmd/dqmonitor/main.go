@@ -6,8 +6,9 @@
 //	dqmonitor replay   --state-dir .dq --batch-id 20260923-001
 //	dqmonitor history  --state-dir .dq
 //
-// Exit code is 0 when every rule passed, 1 when at least one rule failed or
-// errored, and 2 for usage/state-transition problems (e.g. rollback rejected).
+// Exit code is 0 when every rule passed (or on a pure replay), 1 when at least
+// one rule failed or errored, and 2 for usage/state-transition problems (e.g.
+// reclaiming a committed batch, or an unreclaimed interrupted batch).
 package main
 
 import (
@@ -94,7 +95,7 @@ func parseCommon(args []string, needConfig bool) (*flag.FlagSet, *commonFlags) {
 	fs.StringVar(&cf.stateDir, "state-dir", ".dq-state", "directory for durable state and journals")
 	fs.StringVar(&cf.alertFile, "alert-file", "", "alert JSONL file (default <state-dir>/alerts.jsonl)")
 	fs.StringVar(&cf.config, "config", "config.json", "path to declarative JSON config")
-	fs.StringVar(&cf.batchID, "batch-id", "", "batch identifier (must be monotonically ordered)")
+	fs.StringVar(&cf.batchID, "batch-id", "", "batch identifier (unseen older ids are accepted as late arrivals)")
 	fs.BoolVar(&cf.force, "force", false, "reclaim a stale running batch after an interrupted execution")
 	fs.StringVar(&cf.evalTime, "eval-time", "", "deterministic evaluation time (RFC3339); defaults to now")
 	_ = fs.Parse(args)

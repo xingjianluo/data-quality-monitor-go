@@ -17,17 +17,31 @@ type memSink struct {
 	alerts []Alert
 	failN  int
 	calls  int
+	// delivered suppresses a repeat of the same DeliveryID, modeling an
+	// idempotent sink (like the built-in FileSink). nil means no suppression.
+	delivered map[string]bool
 }
 
 func (m *memSink) Send(ctx context.Context, a Alert) error {
+	_, err := m.SendToken(ctx, a)
+	return err
+}
+
+func (m *memSink) SendToken(ctx context.Context, a Alert) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.delivered != nil && a.DeliveryID != "" && m.delivered[a.DeliveryID] {
+		return false, nil // idempotent retry suppressed as a duplicate
+	}
 	m.calls++
 	if m.calls <= m.failN {
-		return os.ErrInvalid // simulated transient delivery failure
+		return false, os.ErrInvalid // simulated transient delivery failure
 	}
 	m.alerts = append(m.alerts, a)
-	return nil
+	if m.delivered != nil && a.DeliveryID != "" {
+		m.delivered[a.DeliveryID] = true
+	}
+	return true, nil
 }
 
 func failedResult(id string, severity model.Severity) model.RuleResult {
@@ -53,6 +67,62 @@ func countLines(t *testing.T, p string) int {
 		}
 	}
 	return n
+}
+
+// countDelivered counts confirmed ("delivered") journal records. Legacy
+// records without a status are also confirmed sends.
+func countDelivered(t *testing.T, p string) int {
+	t.Helper()
+	f, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	n := 0
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		var e map[string]any
+		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
+			continue
+		}
+		st, _ := e["status"].(string)
+		if st == "delivered" || st == "" {
+			n++
+		}
+	}
+	return n
+}
+
+// countPending counts unconfirmed ("pending") records: a pending line that is
+// later followed by a delivered line for the same key is reconciled and is not
+// pending anymore.
+func countPending(t *testing.T, p string) int {
+	t.Helper()
+	f, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	unresolved := map[string]bool{}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		var e struct {
+			BatchID string `json:"batch_id"`
+			RuleID  string `json:"rule_id"`
+			Status  string `json:"status"`
+		}
+		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
+			continue
+		}
+		key := e.BatchID + "\x00" + e.RuleID
+		switch e.Status {
+		case "pending":
+			unresolved[key] = true
+		case "delivered", "":
+			delete(unresolved, key)
+		}
+	}
+	return len(unresolved)
 }
 
 func TestDispatchExactlyOnceAcrossRepeats(t *testing.T) {
@@ -87,8 +157,11 @@ func TestDispatchExactlyOnceAcrossRepeats(t *testing.T) {
 	if len(sink.alerts) != 2 {
 		t.Fatalf("sink received %d alerts, want 2", len(sink.alerts))
 	}
-	if countLines(t, journal) != 2 {
-		t.Fatalf("journal must hold exactly 2 entries")
+	if countDelivered(t, journal) != 2 {
+		t.Fatalf("journal must confirm exactly 2 deliveries")
+	}
+	if countPending(t, journal) != 0 {
+		t.Fatalf("journal must have no pending intents after success")
 	}
 }
 
@@ -103,11 +176,17 @@ func TestDispatchResumesAfterPartialFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected propagated delivery error")
 	}
-	if rep.SentThisRun != 0 || rep.Pending != 1 || rep.Expected != 1 || countLines(t, journal) != 0 {
-		t.Fatalf("failed delivery must not be recorded: rep=%+v", rep)
+	if rep.SentThisRun != 0 || rep.Pending != 1 || rep.Expected != 1 {
+		t.Fatalf("failed delivery must not be counted sent: rep=%+v", rep)
+	}
+	// The delivery INTENT is durable even though the send failed, so a crash
+	// between intent and send is recoverable; nothing is confirmed delivered.
+	if countLines(t, journal) != 1 || countPending(t, journal) != 1 || countDelivered(t, journal) != 0 {
+		t.Fatalf("failed send must leave one pending intent, lines=%d", countLines(t, journal))
 	}
 	// New alerter instance (simulating process restart) resumes and sends once.
-	sink2 := &memSink{}
+	// The channel is idempotent and shares the delivery record across restart.
+	sink2 := &memSink{delivered: map[string]bool{}}
 	a2, _ := NewAlerter(sink2, journal)
 	rep, err = a2.Dispatch(context.Background(), "b1", results, model.SeverityWarning)
 	if err != nil || rep.SentThisRun != 1 || rep.Pending != 0 {
@@ -178,8 +257,9 @@ func TestDispatchBacklogReportAcrossRestarts(t *testing.T) {
 	}
 
 	// Restarted channel fails its first attempt then works: r1 stays pending,
-	// r2 and r3 go through in the same invocation.
-	sink2 := &memSink{failN: 1}
+	// r2 and r3 go through in the same invocation. The channel is idempotent.
+	channel := &memSink{failN: 1, delivered: map[string]bool{}}
+	sink2 := channel
 	a2, _ := NewAlerter(sink2, journal)
 	rep, err = a2.Dispatch(context.Background(), "b1", results, model.SeverityWarning)
 	if err == nil || rep.SentThisRun != 2 || rep.Pending != 1 || rep.AlreadyDelivered != 0 {
@@ -187,26 +267,60 @@ func TestDispatchBacklogReportAcrossRestarts(t *testing.T) {
 	}
 
 	// Another restart (new process) with a healthy channel fills the rest.
-	sink3 := &memSink{}
+	sink3 := channel
 	a3, _ := NewAlerter(sink3, journal)
 	rep, err = a3.Dispatch(context.Background(), "b1", results, model.SeverityWarning)
 	if err != nil || rep.SentThisRun != 1 || rep.Pending != 0 || rep.AlreadyDelivered != 2 {
 		t.Fatalf("final recovery: %+v err=%v", rep, err)
 	}
 
-	// Physically delivered exactly once per rule across all channels.
-	got := map[string]bool{}
-	for _, x := range append(append([]Alert{}, sink2.alerts...), sink3.alerts...) {
-		if got[x.RuleID] {
-			t.Fatalf("rule %s delivered twice", x.RuleID)
-		}
-		got[x.RuleID] = true
+	// Physically delivered exactly once per rule across the shared idempotent
+	// channel (sink2 and sink3 are the same channel seen across restarts).
+	got := map[string]int{}
+	for _, x := range channel.alerts {
+		got[x.RuleID]++
 	}
-	want := map[string]bool{"r1": true, "r2": true, "r3": true}
+	want := map[string]int{"r1": 1, "r2": 1, "r3": 1}
 	if len(got) != 3 {
 		t.Fatalf("delivered rules = %v, want %v", got, want)
 	}
-	if countLines(t, journal) != 3 {
-		t.Fatalf("journal must hold exactly 3 entries")
+	for k, n := range want {
+		if got[k] != n {
+			t.Fatalf("rule %s delivered %d times, want %d", k, got[k], n)
+		}
+	}
+	if countDelivered(t, journal) != 3 || countPending(t, journal) != 0 {
+		t.Fatalf("journal must confirm exactly 3 deliveries with no pending intents")
+	}
+}
+
+// TestFileSinkSendTokenIdempotent verifies the built-in sink suppresses a
+// repeat of the same DeliveryID (the guarantee that closes the crash window)
+// while distinct IDs are written once each.
+func TestFileSinkSendTokenIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "alerts.jsonl")
+	s, err := NewFileSink(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := Alert{BatchID: "b", RuleID: "r", Code: model.ReasonDuplicate, DeliveryID: "tok-1"}
+
+	sent, err := s.SendToken(context.Background(), a)
+	if err != nil || !sent {
+		t.Fatalf("first SendToken: sent=%v err=%v", sent, err)
+	}
+	sent, err = s.SendToken(context.Background(), a) // crash-window retry
+	if err != nil || sent {
+		t.Fatalf("duplicate SendToken must be suppressed: sent=%v err=%v", sent, err)
+	}
+	other := a
+	other.DeliveryID = "tok-2"
+	sent, err = s.SendToken(context.Background(), other)
+	if err != nil || !sent {
+		t.Fatalf("distinct DeliveryID must write: sent=%v err=%v", sent, err)
+	}
+	if n := countLines(t, p); n != 2 {
+		t.Fatalf("physical alert lines=%d, want 2", n)
 	}
 }
